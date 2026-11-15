@@ -20,6 +20,8 @@ from evaluate import get_topk_results, get_metrics_results
 from generation_trie import Trie
 
 def gather_list(target, world_size):
+    if world_size == 1:
+        return target
     
     target_gather_list = [None for _ in range(world_size)]
     dist.all_gather_object(obj=target, object_list=target_gather_list)
@@ -35,12 +37,14 @@ def test_ddp(args):
 
     set_seed(args.seed)
     world_size = int(os.environ.get("WORLD_SIZE", 1))
-    local_rank = int(os.environ.get("LOCAL_RANK") or 0)
+    ddp = world_size > 1
+    local_rank = int(os.environ.get("LOCAL_RANK") or 0) if ddp else args.gpu_id
     torch.cuda.set_device(local_rank)
-    if local_rank == 0:
+    if not ddp or local_rank == 0:
         print(vars(args))
 
-    dist.init_process_group(backend="nccl", world_size=world_size, rank=local_rank)
+    if ddp:
+        dist.init_process_group(backend="nccl", world_size=world_size, rank=local_rank)
 
     device_map = {"": local_rank}
     device = torch.device("cuda",local_rank)
@@ -54,12 +58,16 @@ def test_ddp(args):
         device_map=device_map,
     )
 
-    model = DistributedDataParallel(model, device_ids=[local_rank])
+    if ddp:
+        model = DistributedDataParallel(model, device_ids=[local_rank])
+    generation_model = model.module if ddp else model
 
     prompt_ids = [0]
 
     test_data = load_test_dataset(args)
-    ddp_sampler = DistributedSampler(test_data, num_replicas=world_size, rank=local_rank, drop_last=True)
+    ddp_sampler = (DistributedSampler(test_data, num_replicas=world_size,
+                                      rank=local_rank, drop_last=True)
+                   if ddp else None)
 
     test_data = load_test_dataset(args)
     collator = TestCollatorSave(args, tokenizer)
@@ -80,7 +88,7 @@ def test_ddp(args):
     test_loader = DataLoader(test_data, batch_size=args.test_batch_size, collate_fn=collator,
                              sampler=ddp_sampler, num_workers=2, pin_memory=True)
 
-    if local_rank == 0:
+    if not ddp or local_rank == 0:
         print("data num:", len(test_data))
 
     model.eval()
@@ -98,7 +106,7 @@ def test_ddp(args):
 
         for prompt_id in prompt_ids:
 
-            if local_rank == 0:
+            if not ddp or local_rank == 0:
                 print("Start prompt: ",prompt_id)
 
             test_loader.dataset.set_prompt(prompt_id)
@@ -113,7 +121,7 @@ def test_ddp(args):
                 num_beams = args.num_beams
                 while True:
                     try:
-                        output = model.module.generate(
+                        output = generation_model.generate(
                             input_ids=inputs["input_ids"],
                             attention_mask=inputs["attention_mask"],
                             max_new_tokens=10,
@@ -178,7 +186,7 @@ def test_ddp(args):
                 # print(res_gather_list)
 
 
-                if local_rank == 0:
+                if not ddp or local_rank == 0:
                     # all_device_topk_res = []
                     # for ga_res in res_gather_list:
                     #     all_device_topk_res += ga_res
@@ -200,9 +208,10 @@ def test_ddp(args):
                             temp[m] = metrics_results[m] / total
                         print(temp)
 
-                dist.barrier()
+                if ddp:
+                    dist.barrier()
 
-            if local_rank == 0:
+            if not ddp or local_rank == 0:
                 for m in metrics_results:
                     metrics_results[m] = metrics_results[m] / total
 
@@ -215,11 +224,13 @@ def test_ddp(args):
                 with open(args.save_file, "w") as f:
                     json.dump(save_dict, f, indent=4)
 
-            dist.barrier()
+            if ddp:
+                dist.barrier()
 
-    dist.barrier()
+    if ddp:
+        dist.barrier()
 
-    if local_rank == 0:
+    if not ddp or local_rank == 0:
         mean_results = {}
         min_results = {}
         max_results = {}
