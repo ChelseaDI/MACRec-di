@@ -12,5 +12,7 @@ __pycache__/
 # 原始数据与生成的特征、索引
 /data/raw/
 /data/*/*.emb-*.npy
-/data/*/*.index_*_MACRec-paper-seed2023.json
+
+# MACRec 各实验配置生成的索引
+/data/*/*.index_*_MACRec-*.json
 /data/*/*.index_*_kmeans512.json

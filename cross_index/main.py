@@ -69,7 +69,7 @@ def process_class_info(class_info):
         class_name = class_info[item][0]
         if class_name not in class2item_list:
             class2item_list[class_name] = []
-        class2item_list[class_name].append(item)
+        class2item_list[class_name].append(int(item))
     item2item_list = {}
     for item in class_info:
         item2item_list[int(item)] = class2item_list[class_info[item][0]]
@@ -120,7 +120,10 @@ if __name__ == '__main__':
                   use_cross_rq=args.use_cross_rq,
                   begin_cross_layer=args.begin_cross_layer,
                   text_class_info=text_class_info,
-                  image_class_info=image_class_info
+                  image_class_info=image_class_info,
+                  text_contrast_weight=args.text_contrast_weight,
+                  image_contrast_weight=args.image_contrast_weight,
+                  recon_contrast_weight=args.recon_contrast_weight
                   )
     print(model)
     data_loader = DataLoader(data,num_workers=args.num_workers,
