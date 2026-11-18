@@ -1,4 +1,5 @@
 import json
+import math
 import os
 import argparse
 from collections import defaultdict
@@ -99,6 +100,65 @@ def get_topk_results_ensemble(text_info, image_info):
 
     return results
 
+def get_candidate_distribution(items, scores, temperature):
+    item_scores = {}
+    for item_ids, score in zip(items, scores):
+        item_id = item_ids[0]
+        if item_id != -1 and math.isfinite(score):
+            item_scores[item_id] = max(score, item_scores.get(item_id, -math.inf))
+
+    if not item_scores:
+        return {}
+
+    max_score = max(item_scores.values())
+    masses = {
+        item_id: math.exp((score - max_score) / temperature)
+        for item_id, score in item_scores.items()
+    }
+    total = sum(masses.values())
+    return {item_id: mass / total for item_id, mass in masses.items()}
+
+
+def normalized_entropy(probabilities):
+    entropy = -sum(p * math.log(p) for p in probabilities.values() if p > 0)
+    return entropy / math.log(len(probabilities))
+
+
+def get_topk_results_weighted(text_info, image_info, args):
+    if len(text_info) != len(image_info):
+        raise ValueError("Text and image outputs have different sample counts.")
+
+    results = []
+    for text_sample, image_sample in zip(text_info, image_info):
+        text_user, text_target, text_items, text_scores = text_sample
+        image_user, _, image_items, image_scores = image_sample
+        if text_user != image_user:
+            raise ValueError(f"Text and image outputs are misaligned at user {text_user}.")
+
+        text_probs = get_candidate_distribution(text_items, text_scores, args.text_temperature)
+        image_probs = get_candidate_distribution(image_items, image_scores, args.image_temperature)
+
+        text_weight = args.text_weight
+        if not text_probs:
+            text_weight = 0.0
+        elif not image_probs:
+            text_weight = 1.0
+        elif args.fusion == "entropy" and min(len(text_probs), len(image_probs)) > 1:
+            entropy_gap = normalized_entropy(image_probs) - normalized_entropy(text_probs)
+            text_weight = min(1.0, max(0.0, text_weight + args.entropy_strength * entropy_gap))
+
+        fused_scores = defaultdict(float)
+        for item_id, probability in text_probs.items():
+            fused_scores[item_id] += text_weight * probability
+        for item_id, probability in image_probs.items():
+            fused_scores[item_id] += (1.0 - text_weight) * probability
+
+        ranked_items = sorted(fused_scores, key=fused_scores.__getitem__, reverse=True)
+        results.append([int(item_id in text_target) for item_id in ranked_items])
+
+    return results
+
+
 def main(args):
     metrics = args.metrics.split(",")
 
@@ -174,13 +234,18 @@ def main(args):
 
 
 
-    text_info = get_sort_results(text_outputs, text_scores, text_targets_ids, text_users, 20, text_index2item_id)
-    image_info = get_sort_results(image_outputs, image_scores, image_targets_ids, image_users, 20, image_index2item_id)
+    text_info = get_sort_results(text_outputs, text_scores, text_targets_ids, text_users, args.num_beams, text_index2item_id)
+    image_info = get_sort_results(image_outputs, image_scores, image_targets_ids, image_users, args.num_beams, image_index2item_id)
 
     print('text info: ', len(text_info))
     print('image info: ', len(image_info))
 
-    topk_res = get_topk_results_ensemble(text_info, image_info)
+    if args.fusion == "legacy":
+        topk_res = get_topk_results_ensemble(text_info, image_info)
+        result_name = f"results_ensemble_{args.num_beams}.json"
+    else:
+        topk_res = get_topk_results_weighted(text_info, image_info, args)
+        result_name = f"results_ensemble_{args.fusion}_{args.num_beams}.json"
     metrics_results = get_metrics_results(topk_res, metrics)
 
     total = len(image_targets)
@@ -192,7 +257,7 @@ def main(args):
 
     print(total)
     
-    save_file = os.path.join(args.output_dir, f'results_ensemble_{args.num_beams}.json')
+    save_file = os.path.join(args.output_dir, result_name)
     json.dump(metrics_results, open(save_file, 'w'), indent=4)
 
 
@@ -210,7 +275,22 @@ def parse_args():
     parser.add_argument("--metrics", type=str, default="hit@1,hit@5,hit@10,ndcg@5,ndcg@10", help="Input data path.")
     parser.add_argument("--num_beams", type=int, default=20, help="Input data path.")
 
-    return parser.parse_args()
+    parser.add_argument("--fusion", choices=["legacy", "fixed", "entropy"], default="legacy")
+    parser.add_argument("--text_weight", type=float, default=0.5, help="Base text fusion weight.")
+    parser.add_argument("--entropy_strength", type=float, default=0.3, help="Weight adjustment per unit of normalized entropy difference.")
+    parser.add_argument("--text_temperature", type=float, default=1.0)
+    parser.add_argument("--image_temperature", type=float, default=1.0)
+
+    args = parser.parse_args()
+    if not 0.0 <= args.text_weight <= 1.0:
+        parser.error("--text_weight must be between 0 and 1.")
+    if not math.isfinite(args.entropy_strength) or args.entropy_strength < 0:
+        parser.error("--entropy_strength must be finite and nonnegative.")
+    for name in ("text_temperature", "image_temperature"):
+        temperature = getattr(args, name)
+        if not math.isfinite(temperature) or temperature <= 0:
+            parser.error(f"--{name} must be finite and positive.")
+    return args
 
 
 if __name__ == '__main__':
