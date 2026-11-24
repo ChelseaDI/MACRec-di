@@ -190,6 +190,7 @@ class SeqRecDataset(BaseDataset):
         self.train_data_mode = args.train_data_mode
         self.add_prompt = args.add_prompt
         self.task = task
+        self.use_image_history = task == "seqrec" and getattr(args, "image_history_gate", None) is not None
         self._load_data()
         self._remap_items()
         
@@ -216,11 +217,19 @@ class SeqRecDataset(BaseDataset):
             with open(os.path.join(self.data_path, self.dataset + self.args.image_index_file), 'r') as f:
                 self.indices = json.load(f)
 
+        if self.use_image_history:
+            with open(os.path.join(self.data_path, self.dataset + self.image_index_file), 'r') as f:
+                self.image_indices = json.load(f)
+
     def _remap_items(self):
 
         self.remapped_inters = dict()
         for uid, items in self.inters.items():
             new_items = ["".join(self.indices[str(i)]) for i in items]
+            if self.use_image_history:
+                image_items = ["".join(self.image_indices[str(i)]) for i in items]
+                # Keep both codes together through history sampling and truncation.
+                new_items = list(zip(new_items, image_items))
             self.remapped_inters[uid] = new_items
 
 
@@ -362,6 +371,13 @@ class SeqRecDataset(BaseDataset):
             history = history[-self.max_his_len:]
             d["inters"] = history
             
+        image_history = None
+        if self.use_image_history:
+            d = dict(d)
+            d["item"] = d["item"][0]
+            image_history = "".join(image for _, image in d["inters"])
+            d["inters"] = [text for text, _ in d["inters"]]
+
         if self.add_prompt:
             if self.mode == 'train':
                 prompt_id = random.randint(0, len(self.prompts) - 1)
@@ -380,7 +396,10 @@ class SeqRecDataset(BaseDataset):
             input = ''.join(d["inters"])
             output = d["item"]
 
-        return dict(input_ids=input, labels=output, label=index, task_flag=0)
+        sample = dict(input_ids=input, labels=output, label=index, task_flag=0)
+        if image_history is not None:
+            sample["image_history"] = image_history
+        return sample
 
     
 class ItemImageDataset(BaseDataset):

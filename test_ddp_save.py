@@ -12,7 +12,8 @@ from torch.nn.parallel import DistributedDataParallel
 # from peft import PeftModel
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-from transformers import T5Tokenizer, T5ForConditionalGeneration
+from transformers import T5Config, T5Tokenizer, T5ForConditionalGeneration
+from image_assisted_t5 import ImageAssistedT5
 
 from utils import *
 from collator import TestCollator, TestCollatorSave
@@ -52,8 +53,14 @@ def test_ddp(args):
 
 
     tokenizer = T5Tokenizer.from_pretrained(args.ckpt_path)
-    model = T5ForConditionalGeneration.from_pretrained(
+    config = T5Config.from_pretrained(args.ckpt_path)
+    args.image_history_gate = getattr(config, "image_history_gate", None)
+    if args.image_history_gate is not None and (args.test_task.lower() != "seqrec" or args.add_prompt):
+        raise ValueError("Image-history checkpoints require unprompted seqrec evaluation.")
+    model_class = ImageAssistedT5 if args.image_history_gate is not None else T5ForConditionalGeneration
+    model = model_class.from_pretrained(
         args.ckpt_path,
+        config=config,
         low_cpu_mem_usage=True,
         device_map=device_map,
     )
@@ -69,17 +76,14 @@ def test_ddp(args):
                                       rank=local_rank, drop_last=True)
                    if ddp else None)
 
-    test_data = load_test_dataset(args)
     collator = TestCollatorSave(args, tokenizer)
     all_items = test_data.get_all_items()
 
 
-    candidate_trie = Trie(
-        [
-            [0] + tokenizer.encode(candidate)
-            for candidate in all_items
-        ]
-    )
+    if args.image_history_gate is not None:
+        candidate_trie = generation_model.set_candidate_items(tokenizer, all_items)
+    else:
+        candidate_trie = Trie([[0] + tokenizer.encode(candidate) for candidate in all_items])
     prefix_allowed_tokens = prefix_allowed_tokens_fn(candidate_trie)
 
     # prefix_allowed_tokens = test_data.get_prefix_allowed_tokens_fn(tokenizer)
@@ -122,8 +126,7 @@ def test_ddp(args):
                 while True:
                     try:
                         output = generation_model.generate(
-                            input_ids=inputs["input_ids"],
-                            attention_mask=inputs["attention_mask"],
+                            **inputs,
                             max_new_tokens=10,
                             prefix_allowed_tokens_fn=prefix_allowed_tokens,
                             num_beams=num_beams,
@@ -137,8 +140,6 @@ def test_ddp(args):
                         print("Out of memory!")
                         num_beams = num_beams -1
                         print("Beam:", num_beams)
-                    except Exception:
-                        raise RuntimeError
 
                 output_ids = output["sequences"]
                 scores = output["sequences_scores"]

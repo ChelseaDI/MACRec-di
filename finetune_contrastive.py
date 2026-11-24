@@ -11,6 +11,7 @@ from transformers.trainer_callback import EarlyStoppingCallback
 
 from utils import *
 from collator import Collator
+from image_assisted_t5 import ImageAssistedT5
 from modeling import create_contrastive_model, baseT5
 
 def train(args):
@@ -28,6 +29,12 @@ def train(args):
     if ddp:
         device_map = {"": local_rank}
     device = torch.device("cuda", local_rank)
+
+    if args.image_history_gate is not None and (
+        args.load_model_name is None or args.tasks.lower() != "seqrec" or args.valid_task.lower() != "seqrec"
+        or args.add_prompt
+    ):
+        raise ValueError("Image-history training requires a pretrained checkpoint and unprompted seqrec training and validation.")
 
     if args.load_model_name is not None:
         config = T5Config.from_pretrained(args.load_model_name)
@@ -78,7 +85,17 @@ def train(args):
 
     collator = Collator(args, tokenizer)
     
-    if args.load_model_name is not None:
+    if args.image_history_gate is not None:
+        if add_num:
+            raise ValueError("The checkpoint tokenizer must already contain the text and image code tokens.")
+        config.image_history_gate = args.image_history_gate
+        config.use_cache = True
+        model = ImageAssistedT5.from_pretrained(args.load_model_name, config=config)
+        model.generation_config.use_cache = True
+        model.set_candidate_items(tokenizer, train_data.datasets[0].get_all_items())
+        if not args.unfreeze_t5:
+            model.freeze_text_backbone()
+    elif args.load_model_name is not None:
         model = create_contrastive_model(config)
         pretrained_model = T5ForConditionalGeneration.from_pretrained(args.load_model_name, config=config)
         model.load_state_dict(pretrained_model.state_dict(), strict=False)
@@ -104,7 +121,7 @@ def train(args):
         print_trainable_parameters(model)
 
 
-    if not ddp and torch.cuda.device_count() > 1:
+    if args.image_history_gate is None and not ddp and torch.cuda.device_count() > 1:
         model.is_parallelizable = True
         model.model_parallel = True
 
@@ -116,6 +133,7 @@ def train(args):
         eval_dataset=valid_data,
         args=transformers.TrainingArguments(
             seed=args.seed,
+            remove_unused_columns=args.image_history_gate is None,
             per_device_train_batch_size=args.per_device_batch_size,
             per_device_eval_batch_size=args.per_device_batch_size,
             gradient_accumulation_steps=args.gradient_accumulation_steps,
@@ -145,7 +163,8 @@ def train(args):
         data_collator=collator,
         callbacks=[early_stop]
     )
-    model.config.use_cache = False
+    if args.image_history_gate is None:
+        model.config.use_cache = False
 
 
     trainer.train(
@@ -164,6 +183,12 @@ if __name__ == "__main__":
     parser = parse_train_args(parser)
     parser = parse_dataset_args(parser)
 
+    parser.add_argument("--image_history_gate", choices=["entropy", "fixed"],
+                        help="Train image-history attention with entropy weighting or weight 1.")
+    parser.add_argument("--unfreeze_t5", action="store_true",
+                        help="Fine-tune T5 together with image-history cross-attention.")
     args = parser.parse_args()
+    if args.unfreeze_t5 and args.image_history_gate is None:
+        parser.error("--unfreeze_t5 requires --image_history_gate.")
 
     train(args)
